@@ -405,8 +405,13 @@ static void LinuxMachine_scanCPUTime(LinuxMachine* this) {
    LinuxMachine_updateCPUcount(this);
 
    FILE* file = fopen(PROCSTATFILE, "r");
-   if (!file)
-      CRT_fatalError("Cannot open " PROCSTATFILE);
+   if (!file) {
+      // Calculate a fallback period using the monotonic clock.
+      // This allows per-process CPU percentage to work in restricted environments (Android).
+      uint64_t deltaMs = super->monotonicMs - super->prevMonotonicMs;
+      this->period = (double)deltaMs * this->jiffies / 1000.0;
+      return;
+   }
 
    // One thread per CPU thread + one for the average
    assert(super->existingCPUs < UINT_MAX - 1);
@@ -768,25 +773,26 @@ Machine* Machine_new(UsersTable* usersTable, uid_t userId) {
 
    // Read btime (the kernel boot time, as number of seconds since the epoch)
    FILE* statfile = fopen(PROCSTATFILE, "r");
-   if (statfile == NULL)
-      CRT_fatalError("Cannot open " PROCSTATFILE);
-
    this->boottime = -1;
 
-   while (true) {
-      char buffer[PROC_LINE_LENGTH + 1];
-      if (fgets(buffer, sizeof(buffer), statfile) == NULL)
-         break;
-      if (String_startsWith(buffer, "btime ") == false)
-         continue;
-      if (sscanf(buffer, "btime %lld\n", &this->boottime) == 1)
-         break;
-      CRT_fatalError("Failed to parse btime from " PROCSTATFILE);
+   if (statfile != NULL) {
+      while (true) {
+         char buffer[PROC_LINE_LENGTH + 1];
+         if (fgets(buffer, sizeof(buffer), statfile) == NULL)
+            break;
+         if (String_startsWith(buffer, "btime ") == false)
+            continue;
+         if (sscanf(buffer, "btime %lld\n", &this->boottime) == 1)
+            break;
+      }
+      fclose(statfile);
    }
-   fclose(statfile);
 
-   if (this->boottime == -1)
-      CRT_fatalError("No btime in " PROCSTATFILE);
+   if (this->boottime == -1) {
+      // Fallback: estimate boottime using current time and monotonic clock
+      // This is necessary in restricted environments like Android/Termux
+      this->boottime = (long long)(super->realtime.tv_sec - (super->monotonicMs / 1000));
+   }
 
    // Initialize CPU count
    LinuxMachine_updateCPUcount(this);

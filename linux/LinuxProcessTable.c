@@ -1650,6 +1650,18 @@ static bool LinuxProcessTable_recurseProcTree(LinuxProcessTable* this, openat_ar
       xSnprintf(procFd, sizeof(procFd), "%s/%s", dirFd, entry->d_name);
 #endif
 
+      // Check process ownership early - Android/Termux fix.
+      // If we don't own the process, we can't read its stat file anyway.
+      struct stat sb;
+#ifdef HAVE_OPENAT
+      if (fstat(procFd, &sb) == 0 && sb.st_uid != getuid()) {
+#else
+      if (stat(procFd, &sb) == 0 && sb.st_uid != getuid()) {
+#endif
+         Compat_openatArgClose(procFd);
+         continue;
+      }
+
       bool preExisting;
       Process* proc = ProcessTable_getProcess(pt, pid, &preExisting, LinuxProcess_new);
       LinuxProcess* lp = (LinuxProcess*) proc;
@@ -1725,7 +1737,8 @@ static bool LinuxProcessTable_recurseProcTree(LinuxProcessTable* this, openat_ar
       }
 
       char statCommand[MAX_NAME + 1];
-      unsigned long long int lasttimes = (lp->utime + lp->stime);
+      unsigned long long int lasttimes_u = lp->utime;
+      unsigned long long int lasttimes_s = lp->stime;
       unsigned long int last_tty_nr = proc->tty_nr;
       if (!LinuxProcessTable_readStatFile(lp, procFd, lhost, scanMainThread, statCommand, sizeof(statCommand)))
          goto errorReadingProcess;
@@ -1742,8 +1755,14 @@ static bool LinuxProcessTable_recurseProcTree(LinuxProcessTable* this, openat_ar
       proc->percent_cpu = NAN;
       /* lhost->period might be 0 after system sleep */
       if (lhost->period > 0.0) {
-         float percent_cpu = saturatingSub(lp->utime + lp->stime, lasttimes) / lhost->period * 100.0;
+         unsigned long long utime_diff = saturatingSub(lp->utime, lasttimes_u);
+         unsigned long long stime_diff = saturatingSub(lp->stime, lasttimes_s);
+         float percent_cpu = (utime_diff + stime_diff) / lhost->period * 100.0;
          proc->percent_cpu = MINIMUM(percent_cpu, host->activeCPUs * 100.0F);
+
+         // Tally up the total load for this user's processes (and all its threads)
+         this->totalUserTicks += utime_diff;
+         this->totalSystemTicks += stime_diff;
       }
       proc->percent_mem = proc->m_resident / (double)(host->totalMem) * 100.0;
       Process_updateCPUFieldWidths(proc->percent_cpu);
@@ -1753,16 +1772,16 @@ static bool LinuxProcessTable_recurseProcTree(LinuxProcessTable* this, openat_ar
 
       /* Check if the process is inside a different PID namespace. */
       if (proc->isRunningInContainer == TRI_INITIAL && rootPidNs != (ino_t)-1) {
-         struct stat sb;
+         struct stat sb_ns;
 #if defined(HAVE_OPENAT) && defined(HAVE_FSTATAT)
-         int res = fstatat(procFd, "ns/pid", &sb, 0);
+         int res = fstatat(procFd, "ns/pid", &sb_ns, 0);
 #else
          char path[PATH_MAX];
          xSnprintf(path, sizeof(path), "%s/ns/pid", procFd);
-         int res = stat(path, &sb);
+         int res = stat(path, &sb_ns);
 #endif
          if (res == 0) {
-            proc->isRunningInContainer = (sb.st_ino != rootPidNs) ? TRI_ON : TRI_OFF;
+            proc->isRunningInContainer = (sb_ns.st_ino != rootPidNs) ? TRI_ON : TRI_OFF;
          }
       }
 
@@ -1944,6 +1963,30 @@ errorReadingProcess:
          }
       }
    }
+
+   // Only the top-level call should inject the accumulated data into the CPU bars.
+   if (!mainTask) {
+      FILE* file = fopen(PROCSTATFILE, "r");
+      if (!file) {
+         // Update Aggregate Average (cpuData[0])
+         lhost->cpuData[0].userPeriod = this->totalUserTicks;
+         lhost->cpuData[0].systemPeriod = this->totalSystemTicks;
+         lhost->cpuData[0].totalPeriod = (unsigned long long)(lhost->period * host->activeCPUs);
+         lhost->cpuData[0].idleAllPeriod = saturatingSub(lhost->cpuData[0].totalPeriod, this->totalUserTicks + this->totalSystemTicks);
+
+         // Update the first CPU bar (labeled "0" in UI, which is cpuData[1])
+         if (host->existingCPUs >= 1) {
+            lhost->cpuData[1].userPeriod = this->totalUserTicks;
+            lhost->cpuData[1].systemPeriod = this->totalSystemTicks;
+            lhost->cpuData[1].totalPeriod = (unsigned long long)lhost->period;
+            lhost->cpuData[1].idleAllPeriod = saturatingSub(lhost->cpuData[1].totalPeriod, this->totalUserTicks + this->totalSystemTicks);
+            lhost->cpuData[1].online = true;
+         }
+      } else {
+         fclose(file);
+      }
+   }
+
    closedir(dir);
    return true;
 }
@@ -1953,6 +1996,10 @@ void ProcessTable_goThroughEntries(ProcessTable* super) {
    Machine* host = super->super.host;
    const Settings* settings = host->settings;
    LinuxMachine* lhost = (LinuxMachine*) host;
+
+   // Reset fallback accumulators for restricted environments
+   this->totalUserTicks = 0;
+   this->totalSystemTicks = 0;
 
    if (settings->ss->flags & PROCESS_FLAG_LINUX_AUTOGROUP) {
       // Refer to sched(7) 'autogroup feature' section

@@ -30,6 +30,10 @@ typedef struct LinuxProcessTable_ {
    int netlink_family;
    struct nl_sock* netlink_socket;
    #endif
+
+   /* Fallback accumulators for restricted Android/Termux environments */
+   unsigned long long totalUserTicks;
+   unsigned long long totalSystemTicks;
 } LinuxProcessTable;
 
 #endif
